@@ -1,0 +1,154 @@
+TASK 1: VM & NETWORK SETUP
+
+[2025-06-02 18:20] Time to configure the network.
+$ ping 192.168.56.10
+ping: connect: Network is unreachable
+
+Right, forgot to change the VirtualBox network setting. Switched to a Host-Only Adapter and then configured static IPs using netplan.
+$ sudo nano /etc/netplan/01-netcfg.yaml
+Added this to the master node's config:
+network:
+version: 2
+ethernets:
+enp0s8:
+dhcp4: no
+addresses: [192.168.56.10/24]
+
+$ sudo netplan apply
+
+[2025-06-03 09:15] Let's see if that worked...
+$ ping 192.168.56.10
+PING 192.168.56.10 (192.168.56.10) 56(84) bytes of data.
+64 bytes from 192.168.56.10: icmp_seq=1 ttl=64 time=0.431 ms
+$ ping 192.168.56.12
+PING 192.168.56.12 (192.168.56.12) 56(84) bytes of data.
+64 bytes from 192.168.56.12: icmp_seq=1 ttl=64 time=1.22 ms
+Phew, pings are working. All nodes can communicate now.
+
+[2025-06-03 10:30] Setting hostnames and updating /etc/hosts so I don't have to remember IPs.
+sudohostnamectl set−hostname master
+sudo hostnamectl set-hostname worker1
+sudo hostnamectl set-hostname worker2
+
+Adding these to /etc/hosts on all machines:
+192.168.56.10 master
+192.168.56.11 worker1
+192.168.56.12 worker2
+
+TASK 2: GETTING MPI WORKING
+[2025-06-04 11:00] Installing OpenMPI and some Python stuff.
+$ sudo apt update
+$ sudo apt install -y openmpi-bin openmpi-common libopenmpi-dev python3-pip
+Ugh, the package manager is locked.
+E: Could not get lock /var/lib/dpkg/lock-frontend
+An auto-update was probably running in the background. Waited a bit and it worked.
+
+$ pip3 install mpi4py numpy tensorflow scikit-learn
+...all Python packages installed.
+
+[2025-06-04 14:20] Now for passwordless SSH.
+ssh−keygen−trsa−b2048−f /.ssh/id 
+r
+​
+ sa−N""
+ ssh-copy-id worker1
+$ ssh-copy-id worker2
+
+SSH to the worker failed. Of course.
+$ ssh worker1
+ssh: connect to host worker1 port 22: Connection refused
+Forgot to start the SSH service on the workers. Classic.
+$ sudo systemctl start ssh
+$ sudo systemctl enable ssh
+
+[2025-06-04 15:45] Testing SSH again...
+$ ssh worker1
+Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.11.0-25-generic x86_64)
+$ ssh worker2
+Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.11.0-25-generic x86_64)
+Okay, passwordless login is good to go.
+
+[2025-06-05 10:00] Creating the MPI hostfile.
+master slots=2
+worker1 slots=2
+worker2 slots=2
+
+[2025-06-05 11:30] Simple MPI test first.
+$ mpirun -np 3 --hostfile hostfile hostname
+master
+worker1
+worker2
+
+Aaaand the Python script fails.
+$ mpirun -np 3 --hostfile hostfile python3 -c "from mpi4py import MPI; print(MPI.COMM_WORLD.Get_rank())"
+ImportError: No module named 'mpi4py'
+Naturally, I only installed mpi4py on the master. Need to install the Python packages on the workers too.
+sshworker1"pip3installmpi4pynumpytensorflowscikit−learn"
+ ssh worker2 "pip3 install mpi4py numpy tensorflow scikit-learn"
+
+[2025-06-05 13:20] Let's run the actual distributed MNIST script.
+$ mpirun -np 6 --hostfile hostfile --mca btl tcp,self ... python3 distributed_mnist.py
+...
+Combined Accuracy: 0.962
+Total Execution Time: 0.069s
+It works! Task 2 done.
+
+TASK 3: DOCKER SWARM & SPARK CLUSTER
+[2025-06-06 09:00] Installing Docker on all the nodes.
+curl−fsSLhttps://get.docker.com−oget−docker.sh
+ sudo sh get-docker.sh
+...then had to add my user to the docker group.
+$ sudo usermod -aG docker $USER
+
+Docker service wouldn't start.
+Job for docker.service failed...
+Ah, the conflicting Snap version of Docker was installed. Removed it and the service started fine.
+$ sudo snap remove docker
+$ sudo systemctl start docker
+
+[2025-06-06 11:30] Initializing the Docker Swarm on the master node.
+$ docker swarm init --advertise-addr 192.168.56.10
+Got the join token. Now adding the workers.
+ssh worker1 "docker swarm join −−token SWMTKN−1−5d0mk2l3m"
+ssh worker2 "docker swarm join --token SWMTKN-1-5d0mk2l3m"
+
+Let's check the node list.
+$ docker node ls
+ID                            HOSTNAME   STATUS    AVAILABILITY   MANAGER STATUS
+b3n0k4g7h9s2d5j1m8f4p1q9a * master     Ready     Active         Leader
+bs2fx6l8q1oautl0kgkl9mhpc     worker1    Ready     Active
+
+f529jshn61ckzbmfx3f1fg9r1     worker2    Ready     Active
+
+[2025-06-06 14:15] Deploying the Spark cluster stack.
+$ docker stack deploy -c spark-stack.yml spark-cluster
+As expected, the workers aren't connecting. Probably a firewall issue.
+ERROR: Connection refused to spark-master:7077
+Yep. Opened up the necessary ports.
+sudoufwallow7077
+ sudo ufw allow 8080
+$ sudo ufw allow 4040
+
+[2025-06-06 16:30] Verifying cluster status.
+Sweet, the Spark UI at http://192.168.56.10:8080 shows 2 workers connected. We have a cluster.
+
+TASK 4: DISTRIBUTED BIOINFORMATICS JOB
+[2025-06-07 10:00] Prepping the data directory.
+$ mkdir bioinfo_data
+
+[2025-06-07 13:45] Running the PySpark analysis job.
+dockerexec−it...bash
+ /opt/bitnami/spark/bin/spark-submit ... distributed_gene_expression_analysis.py
+it failed inside the container.
+py4j.protocol.Py4JJavaError: An error occurred while calling o25.fit
+The Spark containers don't have the Python libraries. Need to install them in the running master container.
+$ docker exec spark-master pip install scikit-learn pandas numpy
+
+[2025-06-07 15:20] Trying that again... and success! The job completed and results are saved.
+
+[2025-06-07 16:00] Final checks to make sure everything is still running.
+$ docker stack ps spark-cluster
+ID             NAME                              NODE      CURRENT STATE
+k9l8j7h6g5f4   spark-cluster_spark-master.1      master    Running 15 hours ago
+x9y8z7w6v5u4   spark-cluster_spark-worker.1      worker1   Running 15 hours ago
+d1e2f3g4h5i6   spark-cluster_spark-worker.2      worker2   Running 15 hours ago
